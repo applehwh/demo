@@ -1,0 +1,36 @@
+plugins {
+  id 'java'
+  id 'idea'
+  id 'eclipse'
+  id 'maven-publish'
+  id 'org.springframework.boot' version '2.5.0-M1'
+  id 'io.spring.dependency-management' version '1.0.11.RELEASE'
+}
+
+group = 'com.example'
+version = '0.0.1-SNAPSHOT'
+sourceCompatibility = '11'
+
+repositories {
+		maven { url 'https://repo.spring.io/milestone' }
+	    maven { url 'https://repo.spring.io/snapshot' }
+	    maven { url 'https://mvnrepository.com/artifact' }
+	    mavenCentral()
+	    mavenLocal()
+
+    }
+    
+dependencies {
+  implementation 'org.springframework.boot:spring-boot-starter-webflux'
+  implementation 'org.projectlombok:lombok:1.18.16'
+  annotationProcessor 'org.projectlombok:lombok:1.18.16'
+  testImplementation 'org.springframework.boot:spring-boot-starter-test'
+  testImplementation 'io.projectreactor:reactor-test'
+}
+test {
+  useJUnitPlatform()
+}
+
+wrapper{
+    gradleVersion = '6.6.1'
+}
