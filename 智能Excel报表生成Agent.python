@@ -1,0 +1,352 @@
+```python
+import os
+import pandas as pd
+from typing import TypedDict, Annotated, List, Dict, Any, Optional
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from openpyxl import load_workbook
+from datetime import datetime
+import json# 状态定义
+class AgentState(TypedDict):
+    total_excel_path: str
+    template_excel_path: str
+    output_path: str
+    user_requirement: str
+    total_table_headers: Optional[List[str]]
+    template_headers: Optional[List[str]]
+    column_mapping: Optional[Dict[str, str]]
+    filtered_data: Optional[pd.DataFrame]
+    generated_report: Optional[bool]
+    error_message: Optional[str]
+
+# Excel处理工具类
+class ExcelProcessor:
+    @staticmethod
+    def get_headers(file_path: str) -> List[str]:
+        """获取Excel文件的表头"""
+        try:
+            df = pd.read_excel(file_path, nrows=0)
+            return df.columns.tolist()
+        except Exception as e:
+            raise Exception(f"读取表头失败: {str(e)}")
+    
+    @staticmethod
+    def read_total_table(file_path: str) -> pd.DataFrame:
+        """读取总表数据"""
+        try:
+            return pd.read_excel(file_path)
+        except Exception as e:
+            raise Exception(f"读取总表失败: {str(e)}")
+    
+    @staticmethod
+    def generate_report(template_path: str, data: pd.DataFrame, output_path: str, column_mapping: Dict[str, str]):
+        """根据模板生成报表"""
+        try:
+            # 读取模板
+            template_df = pd.read_excel(template_path, nrows=0)
+            template_headers = template_df.columns.tolist()
+            
+            # 创建新的报表数据
+            report_data = {}
+            for template_col in template_headers:
+                if template_col in column_mapping and column_mapping[template_col] in data.columns:
+                    report_data[template_col] = data[column_mapping[template_col]]
+                else:
+                    report_data[template_col] = [""] * len(data)
+            
+            report_df = pd.DataFrame(report_data)
+            
+            # 保存报表
+            report_df.to_excel(output_path, index=False)
+            return True
+        except Exception as e:
+            raise Exception(f"生成报表失败: {str(e)}")
+
+# LangGraph节点定义
+def initialize_state(state: AgentState) -> AgentState:
+    """初始化状态，读取表头"""
+    try:
+        total_headers = ExcelProcessor.get_headers(state["total_excel_path"])
+        template_headers = ExcelProcessor.get_headers(state["template_excel_path"])
+        
+        return {
+            **state,
+            "total_table_headers": total_headers,
+            "template_headers": template_headers,
+            "error_message": None
+        }
+    except Exception as e:
+        return {
+            **state,
+            "error_message": f"初始化失败: {str(e)}"
+        }
+
+def map_columns(state: AgentState) -> AgentState:
+    """使用LLM映射模板列到总表列"""
+    try:
+        llm = ChatOpenAI(model="gpt-4", temperature=0)
+        
+        system_prompt = """你是一个专业的数据分析师，负责将Excel模板中的列映射到总表中的列。
+
+任务说明：
+1. 根据提供的总表表头和模板表头，建立映射关系
+2. 考虑同义词、缩写和不同的命名方式
+3. 只返回JSON格式的映射结果，键是模板列名，值是总表列名
+4. 如果找不到匹配的列，值设为null
+
+返回格式示例：
+{
+    "日期": "交易日期",
+    "公司名称": "下属公司",
+    "金额": "交易金额"
+}"""
+
+        user_prompt = f"""总表表头：{state['total_table_headers']}
+模板表头：{state['template_headers']}
+用户需求：{state['user_requirement']}
+
+请建立模板列到总表列的映射关系。"""
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        
+        response = llm.invoke(messages)
+        column_mapping = json.loads(response.content)
+        
+        return {
+            **state,
+            "column_mapping": column_mapping,
+            "error_message": None
+        }
+    except Exception as e:
+        return {
+            **state,
+            "error_message": f"列映射失败: {str(e)}"
+        }
+
+def filter_data(state: AgentState) -> AgentState:
+    """根据用户需求筛选数据"""
+    try:
+        llm = ChatOpenAI(model="gpt-4", temperature=0)
+        total_data = ExcelProcessor.read_total_table(state["total_excel_path"])
+        
+        system_prompt = """你是一个专业的数据筛选专家，负责根据用户需求从总表中筛选数据。
+
+任务说明：
+1. 分析用户需求，确定筛选条件
+2. 生成Python代码来筛选pandas DataFrame
+3. 只返回可执行的Python代码
+4. 确保代码安全性，不执行危险操作
+
+返回格式示例：
+# 筛选2024年1月的数据，公司为'A公司'和'B公司'
+filtered_df = df[(df['日期'].dt.year == 2024) & (df['日期'].dt.month == 1) & (df['公司名称'].isin(['A公司', 'B公司']))]"""
+
+        user_prompt = f"""总表数据示例：
+{total_data.head(3).to_string()}
+
+总表表头：{state['total_table_headers']}
+用户需求：{state['user_requirement']}
+列映射关系：{state['column_mapping']}
+
+请生成Python代码来筛选数据，数据变量名为df，筛选结果保存到filtered_df。"""
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        
+        response = llm.invoke(messages)
+        code = response.content
+        
+        # 执行筛选代码
+        local_vars = {"df": total_data}
+        exec(code, globals(), local_vars)
+        filtered_df = local_vars["filtered_df"]
+        
+        return {
+            **state,
+            "filtered_data": filtered_df,
+            "error_message": None
+        }
+    except Exception as e:
+        return {
+            **state,
+            "error_message": f"数据筛选失败: {str(e)}"
+        }
+
+def generate_report(state: AgentState) -> AgentState:
+    """生成最终报表"""
+    try:
+        ExcelProcessor.generate_report(
+            state["template_excel_path"],
+            state["filtered_data"],
+            state["output_path"],
+            state["column_mapping"]
+        )
+        
+        return {
+            **state,
+            "generated_report": True,
+            "error_message": None
+        }
+    except Exception as e:
+        return {
+            **state,
+            "generated_report": False,
+            "error_message": f"报表生成失败: {str(e)}"
+        }
+
+def should_continue(state: AgentState) -> str:
+    """决定下一步操作"""
+    if state.get("error_message"):
+        return "end"
+    if state.get("generated_report"):
+        return "end"
+    if not state.get("total_table_headers"):
+        return "initialize"
+    if not state.get("column_mapping"):
+        return "map_columns"
+    if state.get("filtered_data") is None:
+        return "filter_data"
+    return "generate_report"
+
+# 构建LangGraph
+def create_excel_agent_graph():
+    graph = StateGraph(AgentState)
+    
+    # 添加节点
+    graph.add_node("initialize", initialize_state)
+    graph.add_node("map_columns", map_columns)
+    graph.add_node("filter_data", filter_data)
+    graph.add_node("generate_report", generate_report)
+    
+    # 设置入口点
+    graph.set_entry_point("initialize")
+    
+    # 添加条件边
+    graph.add_conditional_edges(
+        "initialize",
+        should_continue,
+        {
+            "map_columns": "map_columns",
+            "end": END
+        }
+    )
+    
+    graph.add_conditional_edges(
+        "map_columns",
+        should_continue,
+        {
+            "filter_data": "filter_data",
+            "end": END
+        }
+    )
+    
+    graph.add_conditional_edges(
+        "filter_data",
+        should_continue,
+        {
+            "generate_report": "generate_report",
+            "end": END
+        }
+    )
+    
+    graph.add_conditional_edges(
+        "generate_report",
+        should_continue,
+        {
+            "end": END
+        }
+    )
+    
+    return graph.compile()
+
+# 主函数
+def generate_excel_report(
+    total_excel_path: str,
+    template_excel_path: str,
+    output_path: str,
+    user_requirement: str
+):
+    """
+    生成Excel报表的主函数
+    
+    参数:
+        total_excel_path: 总表Excel文件路径
+        template_excel_path: 模板Excel文件路径
+        output_path: 输出文件路径
+        user_requirement: 用户需求描述
+    """
+    # 创建初始状态
+    initial_state = AgentState(
+        total_excel_path=total_excel_path,
+        template_excel_path=template_excel_path,
+        output_path=output_path,
+        user_requirement=user_requirement,
+        total_table_headers=None,
+        template_headers=None,
+        column_mapping=None,
+        filtered_data=None,
+        generated_report=False,
+        error_message=None
+    )
+    
+    # 创建并运行graph
+    graph = create_excel_agent_graph()
+    result = graph.invoke(initial_state)
+    
+    if result.get("error_message"):
+        print(f"处理失败: {result['error_message']}")
+        return False
+    elif result.get("generated_report"):
+        print(f"报表成功生成: {output_path}")
+        return True
+    else:
+        print("处理未完成")
+        return False
+
+# 使用示例
+if __name__ == "__main__":
+    # 设置OpenAI API密钥
+    os.environ["OPENAI_API_KEY"] = "your-api-key-here"
+    
+    # 示例调用
+    success = generate_excel_report(
+        total_excel_path="total_table.xlsx",
+        template_excel_path="template.xlsx",
+        output_path=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        user_requirement="生成2024年3月份集团下属A公司和B公司的财务报表"
+    )
+    
+    print(f"执行结果: {'成功' if success else '失败'}")
+```
+
+这个LangGraph Agent代码实现了以下功能：
+
+## 核心功能
+
+1. **智能表头识别** - 自动读取总表和模板的表头，无需硬编码
+2. **AI列映射** - 使用LLM自动匹配模板列与总表列
+3. **自然语言筛选** - 根据用户的自然语言需求筛选数据
+4. **报表生成** - 按照模板格式生成最终Excel报表
+
+## 工作流程
+
+1. **初始化状态** → 读取总表和模板的表头
+2. **列映射** → LLM智能匹配列名
+3. **数据筛选** → 根据用户需求筛选总表数据
+4. **报表生成** → 按模板格式输出Excel
+
+## 使用方法
+
+只需配置好：
+- 总表路径
+- 模板路径  
+- 输出路径
+- 用户需求（自然语言描述）
+
+Agent会自动处理所有的表头识别、列匹配、数据筛选和报表生成工作！
